@@ -6,20 +6,22 @@ require_once INCLUDE_DIR . "class.mailparse.php";
 class MSGraphPlugin extends Plugin {
 	var $config_class = "MSGraphPluginConfig";
 
-	private $ost = null;
-	private $config = null;
-	private $rest = null;
+	public $ost = null;
+	public $config = null;
+	public $rest = null;
 
 	function bootstrap() {
 		global $ost;
-
 		$this->ost = &$ost;
-		$this->config = $this->getConfig();
-		Signal::connect( 'cron', array($this, 'cron') );
+		$config = $this->getConfig();
+		$config = $this->config;
+		Signal::connect( 'cron', function () use ($config) {
+			$this->cron($config);
+		});
 	}
-
-	function cron() {
-		set_time_limit( 30 * (int) $this->config->get( 'msgraph-emails-per-fetch' ) );
+	
+	function cron($config) {
+		//set_time_limit( 30 * (int) $config->get( 'msgraph-emails-per-fetch' ) );
 
 		// API Limits
 		// https://learn.microsoft.com/en-us/graph/throttling-limits#outlook-service-limits
@@ -31,18 +33,18 @@ class MSGraphPlugin extends Plugin {
 		$this->rest = new MSGraphAPIREST( 
 			array(
 				'root_endpoint_url' => 'https://graph.microsoft.com/v1.0/', 
-				'config' => &$this->config
+				'config' => &$config
 			) 
 		);
 
-		$inboxFolderId = $this->config->get( 'msgraph-inboxFolder-id' );
+		$inboxFolderId = $config->get( 'msgraph-inboxFolder-id' );
 		if( empty( $inboxFolderId ) ) {
-			$inboxFolderId = $this->rest->request( "users/" . rawurlencode( $this->config->get( 'msgraph-email' ) ) ."/mailFolders", 'GET', array( 
-				'$filter' => "displayName eq '" . $this->config->get( 'msgraph-inboxFolder' ) . "'" 
+			$inboxFolderId = $this->rest->request( "users/" . rawurlencode( $config->get( 'msgraph-email' ) ) ."/mailFolders", 'GET', array( 
+				'$filter' => "displayName eq '" . $config->get( 'msgraph-inboxFolder' ) . "'" 
 			) );
 			if( $inboxFolderId && !empty( $inboxFolderId->value ) ) {
 				$inboxFolderId = $inboxFolderId->value[0]->id;
-				$this->config->set( 'msgraph-inboxFolder-id', $inboxFolderId );
+				$config->set( 'msgraph-inboxFolder-id', $inboxFolderId );
 			} else {
 				$this->ost->logWarning( __( 'Microsoft Graph Error' ), __( 'Unabled to find Process New Messages from folder.' ), false );
 				unset( $this->rest ); // Close connection
@@ -50,14 +52,14 @@ class MSGraphPlugin extends Plugin {
 			}
 		}
 
-		$processedFolderId = $this->config->get( 'msgraph-processedFolder-id' );
+		$processedFolderId = $config->get( 'msgraph-processedFolder-id' );
 		if( empty( $processedFolderId ) ) {
-			$processedFolderId = $this->rest->request( "users/" . rawurlencode( $this->config->get( 'msgraph-email' ) ) ."/mailFolders", 'GET', array( 
-				'$filter' => "displayName eq '" . $this->config->get( 'msgraph-processedFolder' ) . "'" 
+			$processedFolderId = $this->rest->request( "users/" . rawurlencode( $config->get( 'msgraph-email' ) ) ."/mailFolders", 'GET', array( 
+				'$filter' => "displayName eq '" . $config->get( 'msgraph-processedFolder' ) . "'" 
 			) );
 			if( $processedFolderId && !empty( $processedFolderId->value ) ) {
 				$processedFolderId = $processedFolderId->value[0]->id;
-				$this->config->set( 'msgraph-processedFolder-id', $processedFolderId );
+				$config->set( 'msgraph-processedFolder-id', $processedFolderId );
 			} else {
 				$this->ost->logWarning( __( 'Microsoft Graph Error' ), __( 'Unabled to find Move Processed Messages to Folder.' ), false );
 				unset( $this->rest ); // Close connection
@@ -67,9 +69,9 @@ class MSGraphPlugin extends Plugin {
 
 		// Filter is used to remove Teams messages: https://learn.microsoft.com/en-us/graph/known-issues#get-messages-returns-chats-in-microsoft-teams
 		// Filter and orderby quirk: https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0&tabs=http#using-filter-and-orderby-in-the-same-query
-		$messages = $this->rest->request( "users/" . rawurlencode( $this->config->get( 'msgraph-email' ) ) . "/mailFolders/" . $inboxFolderId . "/messages", 'GET', array( 
+		$messages = $this->rest->request( "users/" . rawurlencode( $config->get( 'msgraph-email' ) ) . "/mailFolders/" . $inboxFolderId . "/messages", 'GET', array( 
 			'$select' => 'id,subject,receivedDateTime', '$filter' => "receivedDateTime ge 1970-01-01 and subject ne 'IM'", '$orderby' => 'receivedDateTime asc',
-			'$top' => $this->config->get( 'msgraph-emails-per-fetch' ) ) );
+			'$top' => $config->get( 'msgraph-emails-per-fetch' ) ) );
 
 		if( !empty( $messages ) )
 			$messages = $messages->value;
@@ -82,7 +84,7 @@ class MSGraphPlugin extends Plugin {
 		
 		// Process messages into OSTicket
 		foreach( $messages as &$message ) {
-			$this->processMessage( $message );
+			$this->processMessage( $message, $config );
 		}
 
 		// Move processed messages
@@ -96,7 +98,7 @@ class MSGraphPlugin extends Plugin {
 				$move_request->dependsOn = array( $move_request_id - 1 );
 			$move_request->method = 'POST';
 			// POST /users/{id | userPrincipalName}/mailFolders/{id}/messages/{id}/move
-			$move_request->url = "/users/" . rawurlencode( $this->config->get( 'msgraph-email' ) ) . "/messages/" . $message->id . '/move';
+			$move_request->url = "/users/" . rawurlencode( $config->get( 'msgraph-email' ) ) . "/messages/" . $message->id . '/move';
 			$move_request->body = new StdClass;
 			$move_request->body->destinationId = $processedFolderId;
 			$move_request->headers = array( 'Content-Type' => 'application/json' );
@@ -111,12 +113,12 @@ class MSGraphPlugin extends Plugin {
 	}
 
 	// Based on logic from MailFetcher::createTicket()
-	private function processMessage( $message ) {
+	private function processMessage( $message , $config ) {
 		$tempfile = tempnam( sys_get_temp_dir(), 'OME' ); // Window only supports three character temp filename prefixes
 		$fp = fopen( $tempfile, 'w+' );
 		
 		// TODO: Save raw messages to files and process them in a second pass to better handle timeouts
-		$response = $this->rest->request( "users/" . rawurlencode( $this->config->get( 'msgraph-email' ) ) . "/messages/" . $message->id . '/$value', 'GET', array(), array(), false, $fp );
+		$response = $this->rest->request( "users/" . rawurlencode( $config->get( 'msgraph-email' ) ) . "/messages/" . $message->id . '/$value', 'GET', array(), array(), false, $fp );
 
 		if( !empty( $response ) ) {
 			$api = new MSGraphTicketApiController();
